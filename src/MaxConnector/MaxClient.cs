@@ -656,11 +656,80 @@ public sealed class MaxClient
     /// Отправляет текстовое сообщение в чат, при необходимости как ответ на сообщение.
     /// </summary>
     /// <param name="replyToMessageId">ID сообщения из этого же чата, на которое нужно ответить.</param>
-    public async Task<MaxMessage> SendTextAsync(
+    public Task<MaxMessage> SendTextAsync(
         long chatId,
         string text,
         long? replyToMessageId = null,
         CancellationToken cancellationToken = default)
+        => SendMessageAsync(chatId, text, [], replyToMessageId, cancellationToken);
+
+    /// <summary>
+    /// Отправляет в чат одно сообщение с фото (одним или несколькими) и подписью, при необходимости как ответ на сообщение.
+    /// Сначала каждое фото загружается на сервер MAX, потом сообщение отправляется с их токенами.
+    /// </summary>
+    /// <param name="caption">Подпись к фото, может быть пустой.</param>
+    /// <param name="replyToMessageId">ID сообщения из этого же чата, на которое нужно ответить.</param>
+    public async Task<MaxMessage> SendPhotosAsync(
+        long chatId,
+        IReadOnlyList<MaxOutgoingPhoto> photos,
+        string caption = "",
+        long? replyToMessageId = null,
+        CancellationToken cancellationToken = default)
+    {
+        var attaches = new List<object>();
+        foreach (var photo in photos)
+        {
+            attaches.Add(new OutgoingPhotoAttachment(await UploadPhotoAsync(photo, cancellationToken)));
+        }
+
+        return await SendMessageAsync(chatId, caption, [.. attaches], replyToMessageId, cancellationToken);
+    }
+
+    // Загружает фото на сервер MAX и возвращает его токен: спрашиваем адрес загрузки (opcode 80), отправляем на него файл
+    // обычным POST (multipart, поле file), в ответе приходит токен, по которому фото прикрепляется к сообщению.
+    private async Task<string> UploadPhotoAsync(MaxOutgoingPhoto photo, CancellationToken cancellationToken)
+    {
+        var uploadAddress = await SendRequestAsync<GetPhotoUploadUrlResponse>(
+            MaxOpcode.GetPhotoUploadUrl,
+            new GetPhotoUploadUrlRequest(Count: 1),
+            cancellationToken);
+        if (string.IsNullOrEmpty(uploadAddress.Url))
+        {
+            throw new MaxApiException("MAX не выдал адрес для загрузки фото");
+        }
+
+        using var form = new MultipartFormDataContent();
+        var fileContent = new ByteArrayContent(photo.Data);
+        fileContent.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(photo.ContentType);
+        form.Add(fileContent, "file", photo.FileName);
+
+        using var response = await _httpClient.PostAsync(uploadAddress.Url, form, cancellationToken);
+        var responseText = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new MaxApiException($"MAX не принял фото: {(int)response.StatusCode} {responseText}");
+        }
+
+        try
+        {
+            var token = JsonSerializer.Deserialize<UploadPhotoResponse>(responseText, MaxJson.Options)?.Photos?.Values.FirstOrDefault()?.Token;
+            return string.IsNullOrEmpty(token)
+                ? throw new MaxApiException($"MAX не вернул токен загруженного фото: {responseText}")
+                : token;
+        }
+        catch (JsonException ex)
+        {
+            throw new MaxApiException($"MAX вернул неожиданный ответ на загрузку фото: {ex.Message}");
+        }
+    }
+
+    // Общая отправка сообщения: текст, готовые вложения (attaches) и, при необходимости, ответ на сообщение.
+    private async Task<MaxMessage> SendMessageAsync(
+        long chatId,
+        string text,
+        object[] attaches,
+        long? replyToMessageId,
+        CancellationToken cancellationToken)
     {
         long clientMessageId;
         lock (_clientMessageIdLock)
@@ -679,6 +748,7 @@ public sealed class MaxClient
             {
                 ClientMessageId = clientMessageId,
                 Text = text,
+                Attaches = attaches,
                 Quote = replyToMessageId is { } repliedMessageId ? new OutgoingQuote(MaxQuote.Reply, repliedMessageId) : null,
             });
 
