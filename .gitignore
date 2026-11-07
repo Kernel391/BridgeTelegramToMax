@@ -485,5 +485,8 @@ $RECYCLE.BIN/
 /mysql_data
 /.claude/launch.json
 
-# Курсор клиента MAX: локальное состояние, не для репозитория
+# Локальное состояние моста (соответствие чатов MAX и тем Telegram), не для репозитория
 state/
+
+# Токены из профиля запуска (в нём лежат секреты)
+src/Properties/launchSettings.json

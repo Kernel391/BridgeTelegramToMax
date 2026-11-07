@@ -2,8 +2,11 @@
 
 # Этот этап используется при запуске из VS в быстром режиме (по умолчанию для конфигурации отладки)
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS base
-USER $APP_UID
 WORKDIR /app
+# Папка для соответствия чатов MAX и тем Telegram (TelegramConfig:StatePath). Чтобы оно пережило пересоздание
+# контейнера, подключите к /app/state постоянный том.
+RUN mkdir -p /app/state && chown $APP_UID /app/state
+USER $APP_UID
 EXPOSE 8080
 EXPOSE 8081
 
@@ -12,10 +15,10 @@ EXPOSE 8081
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 ARG BUILD_CONFIGURATION=Release
 WORKDIR /src
-COPY ["BridgeTelegramToMax/BridgeTelegramToMax.csproj", "BridgeTelegramToMax/"]
-RUN dotnet restore "./BridgeTelegramToMax/BridgeTelegramToMax.csproj"
+COPY ["src/BridgeTelegramToMax.csproj", "src/"]
+RUN dotnet restore "./src/BridgeTelegramToMax.csproj"
 COPY . .
-WORKDIR "/src/BridgeTelegramToMax"
+WORKDIR "/src/src"
 RUN dotnet build "./BridgeTelegramToMax.csproj" -c $BUILD_CONFIGURATION -o /app/build
 
 # Этот этап используется для публикации проекта службы, который будет скопирован на последний этап

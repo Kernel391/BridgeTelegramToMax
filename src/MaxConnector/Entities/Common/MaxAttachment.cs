@@ -50,6 +50,25 @@ public sealed record MaxAttachment
 
     public long? VideoId { get; init; }
 
+    /// <summary>
+    /// Видео: ширина и высота в пикселях.
+    /// </summary>
+    public int? Width { get; init; }
+
+    public int? Height { get; init; }
+
+    /// <summary>
+    /// Видео: тип ролика. Предположительно 1 означает «кружок» (круглое видеосообщение), у обычного видео
+    /// поле отсутствует или равно 0. Не проверено на настоящем кружке.
+    /// </summary>
+    public int? VideoType { get; init; }
+
+    /// <summary>
+    /// Видео: true, если это «кружок».
+    /// </summary>
+    [JsonIgnore]
+    public bool IsRoundVideo => Type == Video && VideoType == 1;
+
     public long? FileId { get; init; }
 
     /// <summary>

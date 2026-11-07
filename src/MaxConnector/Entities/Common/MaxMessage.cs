@@ -23,15 +23,22 @@ public sealed record MaxMessage
     public string Text { get; init; } = string.Empty;
 
     /// <summary>
+    /// ID, который отправивший клиент придумал сам (в протоколе поле cid). По нему узнаём собственную отправку:
+    /// <see cref="MaxClient.IsSentByThisClient"/>.
+    /// </summary>
+    [JsonPropertyName("cid")]
+    public long? ClientMessageId { get; init; }
+
+    /// <summary>
     /// Время отправки в миллисекундах (в протоколе поле time).
     /// </summary>
     [JsonPropertyName("time")]
     public long? SentAtMs { get; init; }
 
     /// <summary>
-    /// null для нового сообщения, "EDITED" или "REMOVED" для правки и удаления.
+    /// Новое сообщение, правка или удаление. Для нового сообщения поля в протоколе нет.
     /// </summary>
-    public string? Status { get; init; }
+    public MaxMessageStatus Status { get; init; } = MaxMessageStatus.New;
 
     [JsonPropertyName("attaches")]
     public List<MaxAttachment> Attachments { get; init; } = [];
@@ -46,5 +53,5 @@ public sealed record MaxMessage
     public DateTimeOffset? SentAt => SentAtMs is { } milliseconds ? DateTimeOffset.FromUnixTimeMilliseconds(milliseconds) : null;
 
     [JsonIgnore]
-    public bool IsNew => Status is null;
+    public bool IsNew => Status == MaxMessageStatus.New;
 }

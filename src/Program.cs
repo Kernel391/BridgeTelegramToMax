@@ -1,18 +1,36 @@
-using BridgeTelegramToMax.Services;
+using BridgeTelegramToMax.Bridge;
+using BridgeTelegramToMax.Configuration;
+using BridgeTelegramToMax.MaxConnector;
+using Microsoft.Extensions.Options;
+using Telegram.Bot;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Telegram временно отключён: пока отлаживаем только приём сообщений из MAX.
-// builder.Services.AddHostedService<BridgeTelegramToMaxService>();
-builder.Services.AddSingleton<BridgeTelegramToMax.MaxConnector.MaxClient>();
-builder.Services.AddHostedService<MaxListenerService>();
-builder.Services.AddOptions<BridgeTelegramToMax.Configuration.MaxConfig>()
-    .Bind(builder.Configuration.GetSection(BridgeTelegramToMax.Configuration.MaxConfig.SectionName))
-    .ValidateDataAnnotations();
+builder.Services.AddOptions<MaxConfig>()
+    .Bind(builder.Configuration.GetSection(MaxConfig.SectionName))
+    .ValidateDataAnnotations()
+    .ValidateOnStart();
 
-builder.Services.AddOptions<BridgeTelegramToMax.Configuration.TelegramConfig>()
-    .Bind(builder.Configuration.GetSection(BridgeTelegramToMax.Configuration.TelegramConfig.SectionName))
-    .ValidateDataAnnotations();
+builder.Services.AddOptions<TelegramConfig>()
+    .Bind(builder.Configuration.GetSection(TelegramConfig.SectionName))
+    .ValidateDataAnnotations()
+    .ValidateOnStart();
+
+// Бот отправляет и крупные файлы, поэтому у HTTP-клиента большой тайм-аут.
+builder.Services.AddSingleton<ITelegramBotClient>(services =>
+{
+    var config = services.GetRequiredService<IOptions<TelegramConfig>>().Value;
+    var botOptions = new TelegramBotClientOptions(config.ApiToken);
+    return new TelegramBotClient(botOptions, new HttpClient { Timeout = TimeSpan.FromMinutes(30) });
+});
+
+builder.Services.AddSingleton<MaxClient>();
+builder.Services.AddSingleton<TopicStore>();
+builder.Services.AddSingleton<GeneralNotifier>();
+builder.Services.AddSingleton<TelegramMediaSender>();
+builder.Services.AddSingleton<MaxToTelegramForwarder>();
+builder.Services.AddSingleton<TelegramToMaxHandler>();
+builder.Services.AddHostedService<BridgeService>();
 
 builder.Services.AddLogging(logging =>
 {

@@ -40,6 +40,7 @@ public sealed class MaxClient
     // Идентификатор, который клиент сам придумывает для каждого отправляемого сообщения (cid): время в мс, не повторяется.
     private readonly object _clientMessageIdLock = new();
     private long _lastClientMessageId;
+    private readonly ConcurrentDictionary<long, byte> _sentClientMessageIds = new(); // cid отправленных нами сообщений
 
     // Доставка сообщений без дублей. Для каждого чата помним последнее доставленное сообщение: ID и время (мс).
     // Всё хранится только в памяти и защищено _deliveryLock. Предполагается, что ID сообщений в чате растут вместе со временем.
@@ -74,6 +75,25 @@ public sealed class MaxClient
     /// </summary>
     public bool IsConnected { get; private set; }
 
+    /// <summary>
+    /// Вызывается после каждого успешного входа (в том числе после переподключения). Обработчик должен быть
+    /// быстрым и не бросать исключений: он выполняется внутри цикла соединения.
+    /// </summary>
+    public event Action? Connected;
+
+    /// <summary>
+    /// Вызывается, когда ранее установленное соединение оборвалось. Параметр: причина обрыва. Обработчик должен
+    /// быть быстрым и не бросать исключений: он выполняется внутри цикла соединения.
+    /// </summary>
+    public event Action<string>? Disconnected;
+
+    /// <summary>
+    /// Возвращает true, если сообщение отправлено через <see cref="SendTextAsync"/> этим клиентом. Так можно
+    /// отличить собственную отправку от сообщений, написанных с телефона или из другого окна MAX.
+    /// </summary>
+    public bool IsSentByThisClient(MaxMessage message)
+        => message.ClientMessageId.HasValue && _sentClientMessageIds.ContainsKey(message.ClientMessageId.Value);
+
     // ---------- Соединение ----------
 
     /// <summary>
@@ -86,9 +106,11 @@ public sealed class MaxClient
         while (!cancellationToken.IsCancellationRequested)
         {
             var loginCountBefore = _successfulLoginCount;
+            string disconnectReason;
             try
             {
                 await RunSessionAsync(cancellationToken);
+                disconnectReason = "соединение закрыто сервером";
                 _logger.LogWarning("Соединение с MAX закрыто сервером");
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -101,7 +123,14 @@ public sealed class MaxClient
             }
             catch (Exception ex)
             {
+                disconnectReason = ex.Message;
                 _logger.LogWarning(ex, "Ошибка соединения с MAX");
+            }
+
+            // Сообщаем только об обрыве установленного соединения, а не о каждой неудачной попытке подключиться.
+            if (_successfulLoginCount > loginCountBefore)
+            {
+                Disconnected?.Invoke(disconnectReason);
             }
 
             // Если до обрыва удалось войти, отсчёт начинается заново. Иначе (сервер недоступен) пауза
@@ -148,6 +177,7 @@ public sealed class MaxClient
             var loginResponse = await LoginAsync(sessionCancellation.Token);
             _successfulLoginCount++;
             IsConnected = true;
+            Connected?.Invoke();
 
             // Пинг запускаем до загрузки сообщений: она может занять время, а сервер не должен считать нас отключившимся.
             pingTask = PingLoopAsync(webSocket, sessionCancellation.Token);
@@ -501,7 +531,7 @@ public sealed class MaxClient
             {
                 // from = сейчас и backward: последние сообщения чата (проверено на настоящем MAX).
                 var history = await GetChatHistoryAsync(chat.Id, nowMs, forward: 0, backward: messageLimit, cancellationToken);
-                recentMessages.AddRange(history.Where(message => message.Status != "REMOVED"));
+                recentMessages.AddRange(history.Where(message => message.Status != MaxMessageStatus.Removed));
             }
             catch (Exception ex) when (ex is MaxApiException or TimeoutException)
             {
@@ -518,7 +548,7 @@ public sealed class MaxClient
         // Публикуем от старых к новым, как в переписке. Для нас это новые сообщения, даже если их уже правили.
         foreach (var message in recentMessages.OrderBy(message => message.SentAtMs).ThenBy(message => message.Id))
         {
-            PublishMessage(message with { Status = null });
+            PublishMessage(message with { Status = MaxMessageStatus.New });
         }
 
         _logger.LogInformation("Загружено последних сообщений: {Count}", recentMessages.Count);
@@ -579,7 +609,7 @@ public sealed class MaxClient
                     foundNewerMessage = true;
 
                     // Для нас это новое сообщение, даже если его уже успели отредактировать. Удалённые пропускаем.
-                    if (message.Status != "REMOVED" && PublishMessage(message with { Status = null }))
+                    if (message.Status != MaxMessageStatus.Removed && PublishMessage(message with { Status = MaxMessageStatus.New }))
                     {
                         deliveredCount++;
                     }
@@ -599,7 +629,7 @@ public sealed class MaxClient
         catch (Exception ex) when (ex is MaxApiException or TimeoutException)
         {
             _logger.LogWarning(ex, "Не удалось загрузить историю чата {ChatId}, беру только его последнее сообщение", chat.Id);
-            PublishMessage(WithChatId(lastMessage, chat.Id) with { Status = null });
+            PublishMessage(WithChatId(lastMessage, chat.Id) with { Status = MaxMessageStatus.New });
         }
     }
 
@@ -638,6 +668,9 @@ public sealed class MaxClient
             _lastClientMessageId = Math.Max(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), _lastClientMessageId + 1);
             clientMessageId = _lastClientMessageId;
         }
+
+        // Запоминаем cid до отправки: уведомление о нашем сообщении может прийти раньше ответа на запрос.
+        _sentClientMessageIds[clientMessageId] = 0;
 
         var body = new SendMessageRequest(
             ChatId: chatId,
@@ -726,6 +759,30 @@ public sealed class MaxClient
         return new MaxDownload(
             await response.Content.ReadAsByteArrayAsync(cancellationToken),
             response.Content.Headers.ContentType?.MediaType);
+    }
+
+    /// <summary>
+    /// Возвращает размер файла в байтах по заголовку ответа (сам файл не скачивается), либо null, если сервер
+    /// размер не сообщил. Нужен, чтобы не качать то, что заведомо не получится переслать.
+    /// </summary>
+    public async Task<long?> GetDownloadSizeAsync(string url, CancellationToken cancellationToken = default)
+    {
+        using var response = await _httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        return response.Content.Headers.ContentLength;
+    }
+
+    /// <summary>
+    /// Скачивает файл по ссылке сразу на диск, не загружая его целиком в память (для больших видео).
+    /// Возвращает тип файла, который вернул сервер.
+    /// </summary>
+    public async Task<string?> DownloadToFileAsync(string url, string path, CancellationToken cancellationToken = default)
+    {
+        using var response = await _httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        await using var fileStream = File.Create(path);
+        await response.Content.CopyToAsync(fileStream, cancellationToken);
+        return response.Content.Headers.ContentType?.MediaType;
     }
 
     /// <summary>
