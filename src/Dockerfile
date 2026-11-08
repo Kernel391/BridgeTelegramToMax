@@ -1,17 +1,20 @@
-# См. статью по ссылке https://aka.ms/customizecontainer, чтобы узнать как настроить контейнер отладки и как Visual Studio использует этот Dockerfile для создания образов для ускорения отладки.
+# Образ моста MAX <-> Telegram. Собирается из КОРНЯ репозитория: docker build -f src/Dockerfile .
+# Так его собирают и Visual Studio, и CI (см. .github/workflows/docker.yml). Как запустить: docs/deployment.md.
+# См. также https://aka.ms/customizecontainer: как Visual Studio использует этот файл для отладки в контейнере.
 
 # Этот этап используется при запуске из VS в быстром режиме (по умолчанию для конфигурации отладки)
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS base
 WORKDIR /app
-# Папка для соответствия чатов MAX и тем Telegram (TelegramConfig:StatePath). Чтобы оно пережило пересоздание
-# контейнера, подключите к /app/state постоянный том.
+# Папка для соответствия чатов MAX и тем Telegram и недавних сообщений (TelegramConfig:StatePath). Чтобы это пережило
+# пересоздание контейнера, подключите к /app/state постоянный том. Приложение работает не от root, поэтому владельца
+# папки задаём здесь: том при первом подключении наследует его.
 RUN mkdir -p /app/state && chown $APP_UID /app/state
 USER $APP_UID
 EXPOSE 8080
 EXPOSE 8081
 
 
-# Этот этап используется для сборки проекта службы
+# Этот этап используется для сборки проекта службы. Конфигурация по умолчанию Release.
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 ARG BUILD_CONFIGURATION=Release
 WORKDIR /src

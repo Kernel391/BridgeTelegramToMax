@@ -213,7 +213,7 @@ public sealed class MaxToTelegramForwarder(
             : new[] { message };
         var attachmentsToSend = messagesWithAttachments
             .SelectMany(sourceMessage => sourceMessage.Attachments
-                .Where(IsMedia)
+                .Where(IsSentAsSeparateMessage)
                 .Select(attachment => (SourceMessage: sourceMessage, Attachment: attachment)))
             .ToList();
 
@@ -358,7 +358,7 @@ public sealed class MaxToTelegramForwarder(
 
         // Вложения, которые мы файлом не пересылаем (стикер, контакт), обозначаем строкой в тексте.
         var attachmentPlaceholders = message.Attachments
-            .Where(attachment => !IsMedia(attachment))
+            .Where(attachment => !IsSentAsSeparateMessage(attachment))
             .Select(attachment => AttachmentLabel(attachment))
             .Where(attachmentLabel => attachmentLabel is not null)
             .Select(attachmentLabel => $"<i>[{EscapeHtml(attachmentLabel!)}]</i>")

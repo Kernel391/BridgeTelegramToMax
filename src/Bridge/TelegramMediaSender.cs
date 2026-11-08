@@ -24,15 +24,16 @@ public sealed class TelegramMediaSender(
     private readonly long _maxUploadBytes = config.Value.MaxUploadMegabytes * 1024L * 1024L;
 
     /// <summary>
-    /// True для вложений, которые мы умеем пересылать файлом.
+    /// True для вложений, которые уходят в Telegram отдельным сообщением (фото, видео, голосовое, файл, контакт). Остальные
+    /// (например, стикер) обозначаются строкой в тексте сообщения.
     /// </summary>
-    public static bool IsMedia(MaxAttachment attachment)
-        => attachment.Type is MaxAttachment.Photo or MaxAttachment.Video or MaxAttachment.Audio or MaxAttachment.File;
+    public static bool IsSentAsSeparateMessage(MaxAttachment attachment)
+        => attachment.Type is MaxAttachment.Photo or MaxAttachment.Video or MaxAttachment.Audio or MaxAttachment.File or MaxAttachment.Contact;
 
     /// <summary>
-    /// «Кружок» в Telegram не может иметь подписи, у остальных вложений она есть.
+    /// «Кружок» и контакт в Telegram не могут иметь подписи, у остальных вложений она есть.
     /// </summary>
-    public static bool SupportsCaption(MaxAttachment attachment) => !attachment.IsRoundVideo;
+    public static bool SupportsCaption(MaxAttachment attachment) => !attachment.IsRoundVideo && attachment.Type != MaxAttachment.Contact;
 
     /// <summary>
     /// Отправляет вложения сообщения MAX в тему Telegram и возвращает все отправленные сообщения Telegram.
@@ -140,8 +141,8 @@ public sealed class TelegramMediaSender(
         MaxAttachment.Video => attachment.IsRoundVideo ? "Кружок" : "Видео",
         MaxAttachment.Audio => "Голосовое",
         MaxAttachment.File => $"Файл {attachment.FileName}".TrimEnd(),
+        MaxAttachment.Contact => $"Контакт {attachment.FileName}".TrimEnd(),
         "STICKER" => "Стикер",
-        "CONTACT" => "Контакт",
         _ => null,
     };
 
@@ -160,6 +161,7 @@ public sealed class TelegramMediaSender(
             MaxAttachment.Audio => SendAudioAsync(topicId, attachment, caption, replyTo, cancellationToken),
             MaxAttachment.Video => SendVideoAsync(topicId, sourceMessage, attachment, caption, replyTo, cancellationToken),
             MaxAttachment.File => SendFileAsync(topicId, sourceMessage, attachment, caption, replyTo, cancellationToken),
+            MaxAttachment.Contact => SendContactAsync(topicId, attachment, replyTo, cancellationToken),
             _ => throw new NotSupportedException($"Вложение {attachment.Type} не пересылается файлом"),
         };
 
@@ -356,6 +358,62 @@ public sealed class TelegramMediaSender(
 
     // Вложение, готовое к отправке в альбоме: либо байты в памяти (фото), либо временный файл (видео, файлы).
     private sealed record AlbumEntry(int Index, MaxMessage SourceMessage, MaxAttachment Attachment, string FileName, byte[]? Data, string? Path);
+
+    // Контакт MAX уходит контактом Telegram. Телефон берём из поля phone, а если его нет, из визитки (строка TEL).
+    // Telegram без номера телефона контакт не принимает: тогда присылаем имя текстом.
+    private async Task<Message> SendContactAsync(int topicId, MaxAttachment contact, int? replyTo, CancellationToken cancellationToken)
+    {
+        var phone = !string.IsNullOrWhiteSpace(contact.Phone) ? contact.Phone.Trim() : ReadVcardValue(contact.VcfBody, "TEL");
+        var name = !string.IsNullOrWhiteSpace(contact.FileName) ? contact.FileName.Trim() : ReadVcardValue(contact.VcfBody, "FN") ?? "Контакт";
+
+        if (string.IsNullOrWhiteSpace(phone))
+        {
+            return await SendNoticeAsync(topicId, null, replyTo, $"👤 Контакт: {EscapeHtml(name)} (номера телефона в контакте нет)", null, cancellationToken);
+        }
+
+        
+        if (phone.All(char.IsAsciiDigit) && phone.Length >= 10)
+        {
+            phone = "+" + phone;
+        }
+
+        // Telegram принимает визитку не длиннее 2048 байт; если она длиннее, контакт уйдёт без неё.
+        var vcard = contact.VcfBody is { } vcardText && System.Text.Encoding.UTF8.GetByteCount(vcardText) <= 2048 ? vcardText : null;
+
+        return await WithRetryAsync(
+            () => bot.SendContact(
+                _groupChatId,
+                phone,
+                name,
+                vcard: vcard,
+                replyParameters: ToReplyParameters(replyTo),
+                messageThreadId: topicId,
+                cancellationToken: cancellationToken),
+            cancellationToken);
+    }
+
+    // Значение свойства визитки vCard (TEL, FN...): строка вида «TEL;TYPE=CELL:+79991234567», имя свойства может идти
+    // с параметрами через точку с запятой. Возвращает null, если свойства нет или оно пустое.
+    private static string? ReadVcardValue(string? vcard, string propertyName)
+    {
+        if (string.IsNullOrEmpty(vcard))
+        {
+            return null;
+        }
+
+        foreach (var line in vcard.Split(["\r\n", "\n", "\r"], StringSplitOptions.RemoveEmptyEntries))
+        {
+            var trimmedLine = line.Trim();
+            var colonIndex = trimmedLine.IndexOf(':');
+            if (colonIndex > 0 && trimmedLine[..colonIndex].Split(';')[0].Equals(propertyName, StringComparison.OrdinalIgnoreCase))
+            {
+                var value = trimmedLine[(colonIndex + 1)..].Trim();
+                return value.Length > 0 ? value : null;
+            }
+        }
+
+        return null;
+    }
 
     private async Task<Message> SendPhotoAsync(int topicId, MaxAttachment photo, string? caption, int? replyTo, CancellationToken cancellationToken)
     {

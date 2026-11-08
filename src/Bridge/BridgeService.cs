@@ -68,7 +68,17 @@ public class BridgeService(
             await notifier.SendAsync(
                 $"🛑 MAX отклонил токен: {TelegramMediaSender.EscapeHtml(ex.Message)}\nОбновите MaxConfig:Token и DeviceId и перезапустите мост.",
                 CancellationToken.None);
-            applicationLifetime.StopApplication();
+
+            // Приложение не завершаем: в контейнере с автоперезапуском оно бы запускалось заново и каждый раз писало бы это
+            // сообщение в General. Ждём остановки: токен меняют в настройках и перезапускают мост вручную.
+            try
+            {
+                await Task.Delay(Timeout.Infinite, stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                // Остановка приложения.
+            }
         }
 
         await Task.WhenAll(forwardingTask, notifierTask);

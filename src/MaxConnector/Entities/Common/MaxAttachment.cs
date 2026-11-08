@@ -4,7 +4,7 @@ namespace BridgeTelegramToMax.MaxConnector.Entities.Common;
 
 /// <summary>
 /// Вложение сообщения. Поля заполняются только те, что есть у данного типа вложения. Типы, которые нам не нужны
-/// (стикеры, превью ссылок, контакты), приходят с одним только <see cref="Type"/>.
+/// (стикеры, превью ссылок), приходят с одним только <see cref="Type"/>.
 /// </summary>
 public sealed record MaxAttachment
 {
@@ -12,6 +12,7 @@ public sealed record MaxAttachment
     public const string Video = "VIDEO";
     public const string Audio = "AUDIO";
     public const string File = "FILE";
+    public const string Contact = "CONTACT";
 
     [JsonPropertyName("_type")]
     public string Type { get; init; } = "UNKNOWN";
@@ -33,7 +34,7 @@ public sealed record MaxAttachment
     public long? DurationMs { get; init; }
 
     /// <summary>
-    /// Файл: имя (в протоколе поле name).
+    /// Файл: имя файла. Контакт: имя контакта (в протоколе у обоих поле name).
     /// </summary>
     [JsonPropertyName("name")]
     public string? FileName { get; init; }
@@ -42,6 +43,18 @@ public sealed record MaxAttachment
     /// Файл: размер в байтах.
     /// </summary>
     public long? Size { get; init; }
+
+    /// <summary>
+    /// Контакт: номер телефона. Формат поля в MAX снят не с живого трафика, поэтому читается и из строки, и из числа.
+    /// </summary>
+    [JsonConverter(typeof(FlexibleStringConverter))]
+    public string? Phone { get; init; }
+
+    /// <summary>
+    /// Контакт: визитка в формате vCard (в протоколе поле vcfBody). По ней можно найти телефон и имя, если их нет в
+    /// отдельных полях.
+    /// </summary>
+    public string? VcfBody { get; init; }
 
     /// <summary>
     /// Видео и файл: токен, нужен для запроса ссылки.

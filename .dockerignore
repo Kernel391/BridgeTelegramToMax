@@ -28,3 +28,9 @@ README.md
 !.git/config
 !.git/packed-refs
 !.git/refs/heads/**
+# Не нужно образу и не должно попадать в контекст сборки (в launchSettings.json лежат настоящие токены)
+**/launchSettings.json
+**/state
+**/.github
+docs
+tools

@@ -1,0 +1,69 @@
+# Собирает образ моста (Release, linux/amd64) и публикует его в Docker Hub.
+#
+# Когда что происходит:
+#   - push в main        -> образ собирается и публикуется с тегами latest и sha-<короткий хеш коммита>;
+#   - тег вида v1.2.3    -> публикуется ещё и с тегами 1.2.3 и 1.2;
+#   - pull request       -> образ только собирается (проверка, что Dockerfile не сломан), в Docker Hub ничего не уходит;
+#   - вручную (Actions -> Docker -> Run workflow) -> как push в ту ветку, с которой запущено.
+#
+# Что нужно настроить один раз: в репозитории Settings -> Secrets and variables -> Actions -> New repository secret
+#   DOCKERHUB_USERNAME  имя пользователя на Docker Hub
+#   DOCKERHUB_TOKEN     токен доступа (Docker Hub -> Account settings -> Personal access tokens, права Read & Write)
+# Образ публикуется как <DOCKERHUB_USERNAME>/bridge-telegram-to-max, репозиторий на Docker Hub создаётся сам.
+name: Docker
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: bridge-telegram-to-max
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Получение исходников
+        uses: actions/checkout@v4
+
+      - name: Подготовка Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Вход в Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Имя образа и теги. В pull request секретов может не быть (например, из форка), поэтому имя подставляется запасное:
+      # в этом случае образ всё равно никуда не публикуется.
+      - name: Имя образа и теги
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME || 'local' }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Сборка и публикация образа
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: src/Dockerfile
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
