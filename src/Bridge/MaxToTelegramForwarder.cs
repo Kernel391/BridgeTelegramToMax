@@ -61,12 +61,16 @@ public sealed class MaxToTelegramForwarder(
                 return;
             }
 
-            // Отправленное из Telegram уже видно в теме, повторять его не нужно.
-            if (maxClient.IsSentByThisClient(message))
+            // Сообщение уже есть в теме, повторять его не нужно: либо оно отправлено из Telegram (эхо), либо мы его уже
+            // видели и переслали (хранилище помнит последние сообщения и после перезапуска, курсор чата этого не знает,
+            // если сообщение пришло не по порядку).
+            var isAlreadyInTopic = maxClient.IsSentByThisClient(message)
+                                   || topicStore.FindTelegramMessage(message.ChatId, message.Id) is not null;
+            if (isAlreadyInTopic)
             {
                 if (topic is not null)
                 {
-                    topic.LastForwardedMessageId = message.Id;
+                    topic.LastForwardedMessageId = Math.Max(topic.LastForwardedMessageId, message.Id);
                     topicStore.Save(message.ChatId, topic);
                 }
 
