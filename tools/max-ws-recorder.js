@@ -1,238 +1,367 @@
-// Запись WebSocket-кадров web.max.ru с маскированием содержимого (v2: понимает бинарные кадры).
+// Запись WebSocket-кадров web.max.ru с маскированием содержимого (версия 2: понимает бинарные кадры).
 //
 // Как пользоваться: откройте web.max.ru (лучше на экране QR-входа, до авторизации),
 // откройте DevTools (F12) -> Console, вставьте этот файл целиком и нажмите Enter.
 // Дальше входите в аккаунт как обычно. Чтобы забрать результат, выполните в консоли:
-//     copy(__maxRec.dump())          // скопирует всё в буфер обмена
-//     __maxRec.dump(10)              // только кадры начиная с 10-го
+//
+//     copy(__maxWebSocketRecorder.dump())     // копирует ВСЕ кадры в буфер обмена одной строкой, без переводов строк
+//     copy(__maxWebSocketRecorder.dump(10))   // то же, но только кадры начиная с десятого (счёт с нуля)
+//     __maxWebSocketRecorder.show()           // печатает кадры в консоль как раскрывающиеся объекты, чтобы читать глазами
+//     __maxWebSocketRecorder.show(10)         // то же, начиная с десятого кадра
+//     __maxWebSocketRecorder.clear()          // стирает записанное
+//     __maxWebSocketRecorder.reconnect()      // закрывает сокет: сайт переподключится, и запишется рукопожатие и вход
 //
 // Формат кадров, который видит веб-клиент:
-//   текстовый кадр  -> JSON {ver, cmd, seq, opcode, payload}
-//   бинарный кадр   -> 10 байт заголовка (ver u8, cmd u8, seq u16, opcode u16, flags u8 + длина u24,
-//                      все числа big-endian) и далее payload в формате MessagePack.
-//                      flags != 0 означает сжатие (LZ4/Zstd), такой payload не разбирается.
+//   текстовый кадр  -> JSON {ver, cmd, seq, opcode, payload}. Так называются поля в самом протоколе (старая версия
+//                      протокола), поэтому здесь они сохранены как есть.
+//   бинарный кадр   -> 10 байт заголовка и далее тело в формате MessagePack. Заголовок (все числа big-endian):
+//                        версия протокола            1 байт
+//                        команда                     1 байт (0 запрос или уведомление, 1 ответ, 3 ошибка)
+//                        номер запроса (requestId)   2 байта
+//                        код операции (opcode)       2 байта
+//                        флаги сжатия                1 байт (0 без сжатия, 1..254 LZ4, 255 Zstd)
+//                        длина тела                  3 байта
 //
-// Что скрывается: все строки заменяются на <str:длина> (кроме безопасных полей вроде type или
-// appVersion), бинарные поля на <bin:длина>, большие числа (ID, время) на стабильные псевдонимы
-// вида #3/13d (номер/число цифр), поэтому видно, где один и тот же ID встречается в разных
-// местах. Тексты сообщений, токены, телефоны и имена в дамп не попадают.
+// В записи бинарного кадра заголовок разложен на поля version, command, requestId, opcode, compressionFlags,
+// bodyLength, а содержимое лежит в поле body. Если тело было сжато LZ4, добавляется lz4: true.
 //
-// Ограничение: записываются только кадры, отправленные/полученные ПОСЛЕ вставки скрипта.
-// Рукопожатие и вход по токену при загрузке страницы лучше смотреть во вкладке
-// DevTools -> Network -> WS (откройте её ДО загрузки страницы).
+// Что скрывается: все строки заменяются на <str:длина> (кроме безопасных полей вроде type или appVersion),
+// бинарные значения на <bin:длина>, большие числа (ID, время) на стабильные псевдонимы вида #3/13d
+// (порядковый номер числа / сколько в нём цифр), поэтому видно, где один и тот же ID встречается в разных местах.
+// Тексты сообщений, токены, телефоны и имена в дамп не попадают.
+//
+// Ограничение: записываются только кадры, отправленные и полученные ПОСЛЕ вставки скрипта. Рукопожатие и вход по
+// токену при загрузке страницы лучше смотреть во вкладке DevTools -> Network -> WS (откройте её ДО загрузки страницы).
 (() => {
-  if (window.__maxRec) return 'уже установлена';
+  if (window.__maxWebSocketRecorder) return 'уже установлена';
 
-  const KEEP = new Set([
+  // Строки в этих полях не скрываются: в них нет личных данных, а по ним удобно понимать, что происходит.
+  const FIELD_NAMES_WITH_SAFE_STRINGS = new Set([
     'type', '_type', 'status', 'deviceType', 'appVersion', 'locale', 'deviceLocale',
     'osVersion', 'deviceName', 'authTokenType', 'tokenType', 'timezone', 'screen', 'error',
   ]);
-  const t0 = performance.now();
-  const frames = [];
-  const ids = new Map();
 
-  class Bin { constructor(n) { this.n = n; } }
+  // Сколько элементов массива показывать в записи, остальные заменяются пометкой «ещё N».
+  const MAX_ARRAY_ITEMS_SHOWN = 3;
 
-  const alias = (n) => {
-    const k = String(n);
-    if (!ids.has(k)) ids.set(k, ids.size + 1);
-    return `#${ids.get(k)}/${k.replace('-', '').length}d`;
+  const recordingStartedAtMs = performance.now();
+  const recordedFrames = [];
+
+  // Число (ID, время) -> порядковый номер псевдонима. Одно и то же число всегда получает один и тот же псевдоним.
+  const aliasNumbers = new Map();
+
+  // Бинарное значение из MessagePack: само содержимое нам не нужно, запоминаем только размер.
+  class BinaryValue {
+    constructor(byteLength) {
+      this.byteLength = byteLength;
+    }
+  }
+
+  // Заменяет число на псевдоним вида #3/13d: номер псевдонима и количество цифр в числе.
+  const aliasForNumber = (number) => {
+    const numberText = String(number);
+    if (!aliasNumbers.has(numberText)) aliasNumbers.set(numberText, aliasNumbers.size + 1);
+    const digitCount = numberText.replace('-', '').length;
+    return `#${aliasNumbers.get(numberText)}/${digitCount}d`;
   };
 
-  const mask = (v, key) => {
-    if (v === null || typeof v === 'boolean') return v;
-    if (v instanceof Bin) return `<bin:${v.n}>`;
-    if (typeof v === 'bigint') {
-      return (v > -1000n && v < 1000n) ? Number(v) : alias(v.toString());
+  // Возвращает копию значения, из которой убрано всё личное: строки, бинарные данные и большие числа.
+  // fieldName нужен, чтобы оставить без изменений безопасные поля (см. FIELD_NAMES_WITH_SAFE_STRINGS).
+  const maskValue = (value, fieldName) => {
+    if (value === null || typeof value === 'boolean') return value;
+    if (value instanceof BinaryValue) return `<bin:${value.byteLength}>`;
+    if (typeof value === 'bigint') {
+      const isSmall = value > -1000n && value < 1000n;
+      return isSmall ? Number(value) : aliasForNumber(value.toString());
     }
-    if (typeof v === 'number') {
-      if (Number.isInteger(v) && Math.abs(v) < 1000) return v;
-      return alias(Math.trunc(v));
+    if (typeof value === 'number') {
+      const isSmallInteger = Number.isInteger(value) && Math.abs(value) < 1000;
+      return isSmallInteger ? value : aliasForNumber(Math.trunc(value));
     }
-    if (typeof v === 'string') return KEEP.has(key) ? v : `<str:${v.length}>`;
-    if (Array.isArray(v)) {
-      const out = v.slice(0, 3).map((x) => mask(x, key));
-      if (v.length > 3) out.push(`<+${v.length - 3} more>`);
-      return out;
+    if (typeof value === 'string') {
+      return FIELD_NAMES_WITH_SAFE_STRINGS.has(fieldName) ? value : `<str:${value.length}>`;
     }
-    if (typeof v === 'object') {
-      const o = {};
-      for (const k of Object.keys(v)) {
-        const safeKey = /^-?\d{4,}$/.test(k) ? alias(k) : k; // ключи-ID тоже скрываем
-        o[safeKey] = mask(v[k], k);
+    if (Array.isArray(value)) {
+      const shownItems = value.slice(0, MAX_ARRAY_ITEMS_SHOWN).map((item) => maskValue(item, fieldName));
+      if (value.length > MAX_ARRAY_ITEMS_SHOWN) shownItems.push(`<ещё ${value.length - MAX_ARRAY_ITEMS_SHOWN}>`);
+      return shownItems;
+    }
+    if (typeof value === 'object') {
+      const maskedObject = {};
+      for (const key of Object.keys(value)) {
+        // Ключи, которые сами являются ID (4 цифры и больше), тоже скрываем.
+        const maskedKey = /^-?\d{4,}$/.test(key) ? aliasForNumber(key) : key;
+        maskedObject[maskedKey] = maskValue(value[key], key);
       }
-      return o;
+      return maskedObject;
     }
-    return `<${typeof v}>`;
+    return `<${typeof value}>`;
   };
 
-  // Минимальный декодер MessagePack (достаточно для payload протокола).
-  const decodeMsgpack = (u8) => {
-    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
-    const td = new TextDecoder();
-    let p = 0;
-    const str = (n) => { const s = td.decode(u8.subarray(p, p + n)); p += n; return s; };
-    const bin = (n) => { p += n; return new Bin(n); };
-    const arr = (n) => { const a = []; for (let i = 0; i < n; i++) a.push(read()); return a; };
-    const map = (n) => { const o = {}; for (let i = 0; i < n; i++) { const k = read(); o[String(k)] = read(); } return o; };
-    const u16 = () => { const v = dv.getUint16(p); p += 2; return v; };
-    const u32 = () => { const v = dv.getUint32(p); p += 4; return v; };
-    const read = () => {
-      const b = u8[p++];
-      if (b <= 0x7f) return b;
-      if (b >= 0xe0) return b - 256;
-      if ((b & 0xe0) === 0xa0) return str(b & 0x1f);
-      if ((b & 0xf0) === 0x80) return map(b & 0x0f);
-      if ((b & 0xf0) === 0x90) return arr(b & 0x0f);
-      switch (b) {
+  // Минимальный декодер MessagePack: достаточно для тел кадров этого протокола.
+  const decodeMessagePack = (bytes) => {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const textDecoder = new TextDecoder();
+    let position = 0; // откуда читаем следующий байт
+
+    const readString = (byteLength) => {
+      const text = textDecoder.decode(bytes.subarray(position, position + byteLength));
+      position += byteLength;
+      return text;
+    };
+    const readBinary = (byteLength) => {
+      position += byteLength;
+      return new BinaryValue(byteLength);
+    };
+    const readArray = (itemCount) => {
+      const items = [];
+      for (let index = 0; index < itemCount; index++) items.push(readValue());
+      return items;
+    };
+    const readMap = (pairCount) => {
+      const map = {};
+      for (let index = 0; index < pairCount; index++) {
+        const key = readValue();
+        map[String(key)] = readValue();
+      }
+      return map;
+    };
+    const readUint16 = () => {
+      const number = view.getUint16(position);
+      position += 2;
+      return number;
+    };
+    const readUint32 = () => {
+      const number = view.getUint32(position);
+      position += 4;
+      return number;
+    };
+
+    // Читает одно значение: первый байт (typeByte) говорит, что это за значение и как оно закодировано.
+    const readValue = () => {
+      const typeByte = bytes[position++];
+      if (typeByte <= 0x7f) return typeByte;                              // маленькое положительное число
+      if (typeByte >= 0xe0) return typeByte - 256;                        // маленькое отрицательное число
+      if ((typeByte & 0xe0) === 0xa0) return readString(typeByte & 0x1f); // короткая строка
+      if ((typeByte & 0xf0) === 0x80) return readMap(typeByte & 0x0f);    // короткая карта
+      if ((typeByte & 0xf0) === 0x90) return readArray(typeByte & 0x0f);  // короткий массив
+      switch (typeByte) {
         case 0xc0: return null;
         case 0xc2: return false;
         case 0xc3: return true;
-        case 0xc4: return bin(u8[p++]);
-        case 0xc5: return bin(u16());
-        case 0xc6: return bin(u32());
-        case 0xc7: { const n = u8[p++]; p += 1; return bin(n); }
-        case 0xc8: { const n = u16(); p += 1; return bin(n); }
-        case 0xc9: { const n = u32(); p += 1; return bin(n); }
-        case 0xca: { const v = dv.getFloat32(p); p += 4; return v; }
-        case 0xcb: { const v = dv.getFloat64(p); p += 8; return v; }
-        case 0xcc: return u8[p++];
-        case 0xcd: return u16();
-        case 0xce: return u32();
-        case 0xcf: { const v = dv.getBigUint64(p); p += 8; return v; }
-        case 0xd0: { const v = dv.getInt8(p); p += 1; return v; }
-        case 0xd1: { const v = dv.getInt16(p); p += 2; return v; }
-        case 0xd2: { const v = dv.getInt32(p); p += 4; return v; }
-        case 0xd3: { const v = dv.getBigInt64(p); p += 8; return v; }
-        // fixext: байт типа + 1/2/4/8/16 байт данных
-        case 0xd4: return bin(2);
-        case 0xd5: return bin(3);
-        case 0xd6: return bin(5);
-        case 0xd7: return bin(9);
-        case 0xd8: return bin(17);
-        case 0xd9: return str(u8[p++]);
-        case 0xda: return str(u16());
-        case 0xdb: return str(u32());
-        case 0xdc: return arr(u16());
-        case 0xdd: return arr(u32());
-        case 0xde: return map(u16());
-        case 0xdf: return map(u32());
-        default: throw new Error('msgpack: неизвестный тип 0x' + b.toString(16));
+        case 0xc4: return readBinary(bytes[position++]);
+        case 0xc5: return readBinary(readUint16());
+        case 0xc6: return readBinary(readUint32());
+        // ext: байт типа расширения и затем данные. Нам важен только размер, поэтому показываем как бинарное значение.
+        case 0xc7: { const byteLength = bytes[position++]; position += 1; return readBinary(byteLength); }
+        case 0xc8: { const byteLength = readUint16(); position += 1; return readBinary(byteLength); }
+        case 0xc9: { const byteLength = readUint32(); position += 1; return readBinary(byteLength); }
+        case 0xca: { const number = view.getFloat32(position); position += 4; return number; }
+        case 0xcb: { const number = view.getFloat64(position); position += 8; return number; }
+        case 0xcc: return bytes[position++];
+        case 0xcd: return readUint16();
+        case 0xce: return readUint32();
+        case 0xcf: { const number = view.getBigUint64(position); position += 8; return number; }
+        case 0xd0: { const number = view.getInt8(position); position += 1; return number; }
+        case 0xd1: { const number = view.getInt16(position); position += 2; return number; }
+        case 0xd2: { const number = view.getInt32(position); position += 4; return number; }
+        case 0xd3: { const number = view.getBigInt64(position); position += 8; return number; }
+        // fixext: байт типа расширения и затем 1, 2, 4, 8 или 16 байт данных
+        case 0xd4: return readBinary(2);
+        case 0xd5: return readBinary(3);
+        case 0xd6: return readBinary(5);
+        case 0xd7: return readBinary(9);
+        case 0xd8: return readBinary(17);
+        case 0xd9: return readString(bytes[position++]);
+        case 0xda: return readString(readUint16());
+        case 0xdb: return readString(readUint32());
+        case 0xdc: return readArray(readUint16());
+        case 0xdd: return readArray(readUint32());
+        case 0xde: return readMap(readUint16());
+        case 0xdf: return readMap(readUint32());
+        default: throw new Error('msgpack: неизвестный тип 0x' + typeByte.toString(16));
       }
     };
-    const value = read();
-    if (p !== u8.length) throw new Error(`msgpack: лишние байты (${u8.length - p})`);
-    return value;
+
+    const decodedValue = readValue();
+    if (position !== bytes.length) throw new Error(`msgpack: лишние байты (${bytes.length - position})`);
+    return decodedValue;
   };
 
-  // Декодер LZ4 block (без заголовка кадра): последовательности «токен, литералы, смещение, повтор».
-  const lz4Block = (src) => {
-    const out = [];
-    let i = 0;
-    const len = () => { let n = 0; let b; do { b = src[i++]; n += b; } while (b === 255); return n; };
-    while (i < src.length) {
-      const token = src[i++];
-      let lit = token >> 4;
-      if (lit === 15) lit += len();
-      for (let k = 0; k < lit; k++) out.push(src[i++]);
-      if (i >= src.length) break; // последняя последовательность содержит только литералы
-      const offset = src[i] | (src[i + 1] << 8);
-      i += 2;
-      let match = token & 15;
-      if (match === 15) match += len();
-      match += 4;
-      let pos = out.length - offset;
-      if (offset === 0 || pos < 0) throw new Error('lz4: неверное смещение');
-      for (let k = 0; k < match; k++) out.push(out[pos++]);
+  // Декодер LZ4 block (без заголовка кадра). Данные состоят из последовательностей:
+  // «токен, литералы (байты как есть), смещение назад, повтор уже распакованного куска».
+  const decodeLz4Block = (compressed) => {
+    const decompressed = [];
+    let position = 0;
+
+    // Длина может не поместиться в 4 бита токена: тогда к ней прибавляются следующие байты, пока они равны 255.
+    const readExtraLength = () => {
+      let extraLength = 0;
+      let nextByte;
+      do {
+        nextByte = compressed[position++];
+        extraLength += nextByte;
+      } while (nextByte === 255);
+      return extraLength;
+    };
+
+    while (position < compressed.length) {
+      const token = compressed[position++];
+
+      let literalLength = token >> 4; // старшие 4 бита токена: сколько литералов идёт следом
+      if (literalLength === 15) literalLength += readExtraLength();
+      for (let index = 0; index < literalLength; index++) decompressed.push(compressed[position++]);
+
+      // Последняя последовательность содержит только литералы, повтора в ней нет.
+      if (position >= compressed.length) break;
+
+      const matchOffset = compressed[position] | (compressed[position + 1] << 8); // на сколько байт назад смотреть
+      position += 2;
+
+      let matchLength = token & 15; // младшие 4 бита токена: длина повтора минус 4
+      if (matchLength === 15) matchLength += readExtraLength();
+      matchLength += 4;
+
+      let copyFrom = decompressed.length - matchOffset;
+      if (matchOffset === 0 || copyFrom < 0) throw new Error('lz4: неверное смещение');
+      for (let index = 0; index < matchLength; index++) decompressed.push(decompressed[copyFrom++]);
     }
-    return Uint8Array.from(out);
+
+    return Uint8Array.from(decompressed);
   };
 
-  const decodeBinaryFrame = (u8) => {
-    if (u8.length < 10) return `<binary:${u8.length}, короче заголовка>`;
-    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
-    const packed = dv.getUint32(6);
-    const flags = packed >>> 24;
-    const len = packed & 0xffffff;
-    const head = { ver: u8[0], cmd: u8[1], seq: dv.getUint16(2), opcode: dv.getUint16(4), flags, len };
-    if (10 + len !== u8.length) return { ...head, payload: `<длина в заголовке не сходится: всего ${u8.length} байт>` };
-    if (len === 0) return { ...head, payload: null };
-    const body = u8.subarray(10);
-    if (flags === 0xff) return { ...head, payload: '<zstd, не разбирается>' };
+  // Разбирает бинарный кадр: заголовок раскладывает по полям, тело декодирует (при необходимости сначала распаковывает).
+  const decodeBinaryFrame = (frameBytes) => {
+    if (frameBytes.length < 10) return `<бинарный кадр ${frameBytes.length} байт, короче заголовка>`;
+
+    const view = new DataView(frameBytes.buffer, frameBytes.byteOffset, frameBytes.byteLength);
+    const compressionFlagsAndBodyLength = view.getUint32(6);
+    const compressionFlags = compressionFlagsAndBodyLength >>> 24;
+    const bodyLength = compressionFlagsAndBodyLength & 0xffffff;
+    const header = {
+      version: frameBytes[0],
+      command: frameBytes[1],
+      requestId: view.getUint16(2),
+      opcode: view.getUint16(4),
+      compressionFlags,
+      bodyLength,
+    };
+
+    if (10 + bodyLength !== frameBytes.length) {
+      return { ...header, body: `<длина тела в заголовке не сходится: всего ${frameBytes.length} байт>` };
+    }
+    if (bodyLength === 0) return { ...header, body: null };
+
+    const bodyBytes = frameBytes.subarray(10);
+    if (compressionFlags === 0xff) return { ...header, body: '<zstd, не разбирается>' };
+
     try {
-      if (flags === 0) return { ...head, payload: mask(decodeMsgpack(body)) };
-      // flags 1..254: LZ4. Если сразу после распаковки msgpack не сходится, пробуем пропустить
-      // 4 байта (в некоторых реализациях перед данными стоит длина распакованного блока).
+      if (compressionFlags === 0) return { ...header, body: maskValue(decodeMessagePack(bodyBytes)) };
+
+      // Флаги 1..254 означают LZ4. Если после распаковки MessagePack не сходится, пробуем пропустить первые
+      // 4 байта: в некоторых реализациях перед данными стоит длина распакованного блока.
       try {
-        return { ...head, lz4: true, payload: mask(decodeMsgpack(lz4Block(body))) };
+        return { ...header, lz4: true, body: maskValue(decodeMessagePack(decodeLz4Block(bodyBytes))) };
       } catch {
-        return { ...head, lz4: true, skip4: true, payload: mask(decodeMsgpack(lz4Block(body.subarray(4)))) };
+        return { ...header, lz4: true, skippedFirst4Bytes: true, body: maskValue(decodeMessagePack(decodeLz4Block(bodyBytes.subarray(4)))) };
       }
-    } catch (e) {
-      return { ...head, payload: `<ошибка разбора: ${e.message}>` };
+    } catch (error) {
+      return { ...header, body: `<ошибка разбора: ${error.message}>` };
     }
   };
 
-  const toBytes = (data) => {
-    if (data instanceof Blob) return data.arrayBuffer().then((b) => new Uint8Array(b));
+  // Приводит данные кадра (Blob, ArrayBuffer или типизированный массив) к Uint8Array. Blob читается асинхронно.
+  const toUint8Array = (data) => {
+    if (data instanceof Blob) return data.arrayBuffer().then((buffer) => new Uint8Array(buffer));
     if (data instanceof ArrayBuffer) return Promise.resolve(new Uint8Array(data));
     if (ArrayBuffer.isView(data)) return Promise.resolve(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
     return Promise.reject(new Error('неизвестный тип данных'));
   };
 
-  const record = (dir, sock, data) => {
-    let ws = '';
-    try { const u = new URL(sock.url); ws = u.host + u.pathname; } catch { /* ignore */ }
-    // Запись добавляется сразу, чтобы сохранить порядок; бинарное содержимое дописывается позже.
-    const entry = { i: frames.length, t: Math.round(performance.now() - t0), dir, ws, kind: '', frame: null };
-    frames.push(entry);
+  // Записывает один кадр. direction: 'out' (отправили мы) или 'in' (пришёл от сервера).
+  const recordFrame = (direction, socket, data) => {
+    let socketAddress = '';
+    try {
+      const url = new URL(socket.url);
+      socketAddress = url.host + url.pathname;
+    } catch { /* адрес не разобрался: записываем без него */ }
+
+    // Запись добавляется сразу, чтобы сохранить порядок кадров; содержимое бинарного кадра дописывается позже.
+    const record = {
+      index: recordedFrames.length,
+      elapsedMs: Math.round(performance.now() - recordingStartedAtMs),
+      direction,
+      socketAddress,
+      frameKind: '',
+      frame: null,
+    };
+    recordedFrames.push(record);
+
     if (typeof data === 'string') {
-      entry.kind = 'text';
+      record.frameKind = 'text';
       try {
-        const f = JSON.parse(data);
-        entry.frame = { ...f, payload: mask(f.payload) };
+        const textFrame = JSON.parse(data);
+        record.frame = { ...textFrame, payload: maskValue(textFrame.payload) };
       } catch {
-        entry.frame = `<non-json text:${data.length}>`;
+        record.frame = `<текст не в формате JSON, ${data.length} символов>`;
       }
       return;
     }
-    entry.kind = 'binary';
-    toBytes(data).then((u8) => { entry.frame = decodeBinaryFrame(u8); })
-      .catch((e) => { entry.frame = `<не удалось прочитать: ${e.message}>`; });
+
+    record.frameKind = 'binary';
+    toUint8Array(data)
+      .then((frameBytes) => { record.frame = decodeBinaryFrame(frameBytes); })
+      .catch((error) => { record.frame = `<не удалось прочитать: ${error.message}>`; });
   };
 
-  // Исходящие: send живёт в прототипе, поэтому перехват действует и на уже открытый сокет.
-  let lastSocket = null;
-  const origSend = WebSocket.prototype.send;
+  // Исходящие кадры. Метод send живёт в прототипе WebSocket, поэтому перехват действует и на уже открытый сокет.
+  let lastSeenSocket = null;
+  const originalSend = WebSocket.prototype.send;
   WebSocket.prototype.send = function (data) {
-    lastSocket = this; // запоминаем сокет, чтобы можно было вызвать reconnect()
-    try { record('out', this, data); } catch { /* запись не должна ломать сайт */ }
-    return origSend.call(this, data);
+    lastSeenSocket = this; // запоминаем сокет, чтобы можно было вызвать reconnect()
+    try { recordFrame('out', this, data); } catch { /* запись не должна ломать сайт */ }
+    return originalSend.call(this, data);
   };
 
-  // Входящие: подменяем геттер MessageEvent.data, он вызывается, когда сайт читает сообщение.
-  const desc = Object.getOwnPropertyDescriptor(MessageEvent.prototype, 'data');
-  const seen = new WeakSet();
+  // Входящие кадры. Подменяем геттер MessageEvent.data: сайт вызывает его, когда читает полученное сообщение.
+  const originalDataProperty = Object.getOwnPropertyDescriptor(MessageEvent.prototype, 'data');
+  const alreadyRecordedEvents = new WeakSet(); // одно событие сайт может прочитать несколько раз, записываем один
   Object.defineProperty(MessageEvent.prototype, 'data', {
     configurable: true,
     get() {
-      const value = desc.get.call(this);
+      const data = originalDataProperty.get.call(this);
       try {
-        if (this.target instanceof WebSocket && !seen.has(this)) {
-          seen.add(this);
-          record('in', this.target, value);
+        if (this.target instanceof WebSocket && !alreadyRecordedEvents.has(this)) {
+          alreadyRecordedEvents.add(this);
+          recordFrame('in', this.target, data);
         }
-      } catch { /* ignore */ }
-      return value;
+      } catch { /* запись не должна ломать сайт */ }
+      return data;
     },
   });
 
-  window.__maxRec = {
-    frames,
-    dump: (from = 0) => JSON.stringify(frames.slice(from), null, 1),
-    clear: () => { frames.length = 0; },
+  window.__maxWebSocketRecorder = {
+    frames: recordedFrames,
+
+    // Все кадры (начиная с fromIndex) одной строкой JSON без переводов строк: удобно копировать через copy(...).
+    dump: (fromIndex = 0) => JSON.stringify(recordedFrames.slice(fromIndex)),
+
+    // Печатает кадры в консоль по одному, как раскрывающиеся объекты: удобно читать глазами.
+    show: (fromIndex = 0) => {
+      recordedFrames.slice(fromIndex).forEach((record) => console.log(record));
+      return `показано кадров: ${Math.max(recordedFrames.length - fromIndex, 0)}`;
+    },
+
+    clear: () => { recordedFrames.length = 0; },
+
     // Закрывает текущий сокет: сайт переподключится, и мы запишем рукопожатие и вход по токену.
-    reconnect: () => { if (lastSocket) { lastSocket.close(); return 'сокет закрыт'; } return 'сокет ещё не найден'; },
+    reconnect: () => {
+      if (lastSeenSocket) {
+        lastSeenSocket.close();
+        return 'сокет закрыт';
+      }
+      return 'сокет ещё не найден';
+    },
   };
   return 'установлена';
 })();
