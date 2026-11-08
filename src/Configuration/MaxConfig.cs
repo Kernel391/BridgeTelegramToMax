@@ -41,4 +41,11 @@ public class MaxConfig
     /// </summary>
     [Range(0, 100)]
     public int InitialMessageCount { get; set; } = 20;
+
+    /// <summary>
+    /// Сколько секунд ждать, пока сервер MAX обработает загруженный файл, прежде чем отправлять сообщение с ним.
+    /// Если уведомление не пришло за это время, файл не отправляется и бот сообщает об ошибке.
+    /// </summary>
+    [Range(1, 600)]
+    public int FileProcessingTimeoutSeconds { get; set; } = 60;
 }

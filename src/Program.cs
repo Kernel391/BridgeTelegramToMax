@@ -16,7 +16,6 @@ builder.Services.AddOptions<TelegramConfig>()
     .ValidateDataAnnotations()
     .ValidateOnStart();
 
-// Бот отправляет и крупные файлы, поэтому у HTTP-клиента большой тайм-аут.
 builder.Services.AddSingleton<ITelegramBotClient>(services =>
 {
     var config = services.GetRequiredService<IOptions<TelegramConfig>>().Value;

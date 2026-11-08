@@ -7,11 +7,6 @@ using Telegram.Bot.Types;
 
 namespace BridgeTelegramToMax.Bridge;
 
-/// <summary>
-/// Отправляет в MAX текст и картинки, написанные в теме Telegram: в тот чат MAX, которому принадлежит тема. Несколько
-/// картинок альбомом уходят одним сообщением. Ответ на сообщение в Telegram становится ответом в MAX. Успех
-/// отмечается реакцией 👍, а неудача ответом с причиной.
-/// </summary>
 public sealed class TelegramToMaxHandler(
     MaxClient maxClient,
     TopicStore topics,
@@ -21,7 +16,7 @@ public sealed class TelegramToMaxHandler(
     // Сообщение, написанное давно (пока бот был выключен), в MAX не отправляем: оно было бы неожиданным.
     private static readonly TimeSpan MaxMessageAge = TimeSpan.FromMinutes(2);
 
-    // Альбом Telegram приходит отдельными сообщениями с общим MediaGroupId. Столько ждём остальные картинки альбома,
+    // Альбом Telegram приходит отдельными сообщениями с общим MediaGroupId. Столько ждём остальные вложения альбома,
     // прежде чем отправить их в MAX одним сообщением.
     private static readonly TimeSpan AlbumWaitTime = TimeSpan.FromSeconds(1.5);
 
@@ -34,9 +29,10 @@ public sealed class TelegramToMaxHandler(
     private readonly object _pendingAlbumsLock = new();
 
     /// <summary>
-    /// Картинка из сообщения Telegram: что скачать и как назвать файл для MAX.
+    /// Вложение из сообщения Telegram: что скачать и как назвать файл для MAX. IsPhoto: true для обычного фото
+    /// (в MAX уходит фотографией), false для документа (в MAX уходит файлом).
     /// </summary>
-    private sealed record TelegramPhoto(string FileId, long? Size, string FileName, string ContentType);
+    private sealed record TelegramAttachment(string FileId, long? Size, string FileName, string ContentType, bool IsPhoto);
 
     public async Task HandleUpdateAsync(ITelegramBotClient bot, Update update, CancellationToken cancellationToken)
     {
@@ -67,10 +63,10 @@ public sealed class TelegramToMaxHandler(
             return; // тема, которую создали не мы
         }
 
-        var hasPhoto = GetPhoto(message) is not null;
-        if (message.Text is not { Length: > 0 } && !hasPhoto)
+        var hasAttachment = GetAttachment(message) is not null;
+        if (message.Text is not { Length: > 0 } && !hasAttachment)
         {
-            await ReplyAsync(bot, message, "В MAX можно отправлять только текст и картинки.", cancellationToken);
+            await ReplyAsync(bot, message, "В MAX можно отправлять только текст, картинки и файлы.", cancellationToken);
             return;
         }
 
@@ -80,9 +76,9 @@ public sealed class TelegramToMaxHandler(
             return;
         }
 
-        if (message.MediaGroupId is { } albumId && hasPhoto)
+        if (message.MediaGroupId is { } albumId && hasAttachment)
         {
-            // Первая картинка альбома запускает ожидание остальных, следующие просто добавляются в список.
+            // Первое вложение альбома запускает ожидание остальных, следующие просто добавляются в список.
             bool isFirstInAlbum;
             lock (_pendingAlbumsLock)
             {
@@ -153,21 +149,35 @@ public sealed class TelegramToMaxHandler(
 
         try
         {
-            var photoSources = telegramMessages.Select(GetPhoto).OfType<TelegramPhoto>().ToList();
+            // В одном альбоме Telegram бывают только фото и видео или только документы, поэтому вид сообщения MAX
+            // (фотографии или файлы) определяет первое вложение.
+            var attachments = telegramMessages.Select(GetAttachment).OfType<TelegramAttachment>().ToList();
             MaxMessage sentMessage;
-            if (photoSources.Count == 0)
+            if (attachments.Count == 0)
             {
                 sentMessage = await maxClient.SendTextAsync(maxChatId, text, replyToMaxMessageId, cancellationToken);
             }
             else
             {
-                var photos = new List<MaxOutgoingPhoto>();
-                foreach (var photoSource in photoSources)
+                var downloadedAttachments = new List<(TelegramAttachment Attachment, byte[] Data)>();
+                foreach (var attachment in attachments)
                 {
-                    photos.Add(await DownloadPhotoAsync(bot, photoSource, cancellationToken));
+                    downloadedAttachments.Add((attachment, await DownloadAttachmentAsync(bot, attachment, cancellationToken)));
                 }
 
-                sentMessage = await maxClient.SendPhotosAsync(maxChatId, photos, text, replyToMaxMessageId, cancellationToken);
+                sentMessage = attachments[0].IsPhoto
+                    ? await maxClient.SendPhotosAsync(
+                        maxChatId,
+                        downloadedAttachments.Select(item => new MaxOutgoingPhoto(item.Data, item.Attachment.FileName, item.Attachment.ContentType)).ToList(),
+                        text,
+                        replyToMaxMessageId,
+                        cancellationToken)
+                    : await maxClient.SendFilesAsync(
+                        maxChatId,
+                        downloadedAttachments.Select(item => new MaxOutgoingFile(item.Data, item.Attachment.FileName, item.Attachment.ContentType)).ToList(),
+                        text,
+                        replyToMaxMessageId,
+                        cancellationToken);
             }
 
             foreach (var telegramMessage in telegramMessages)
@@ -175,7 +185,7 @@ public sealed class TelegramToMaxHandler(
                 topics.RememberMessage(maxChatId, sentMessage.Id, telegramMessage.MessageId);
             }
 
-            logger.LogInformation("Отправлено в MAX, чат {ChatId}: {Text} (картинок: {PhotoCount})", maxChatId, text, photoSources.Count);
+            logger.LogInformation("Отправлено в MAX, чат {ChatId}: {Text} (вложений: {AttachmentCount})", maxChatId, text, attachments.Count);
 
             if (isReply && replyToMaxMessageId is null)
             {
@@ -208,28 +218,40 @@ public sealed class TelegramToMaxHandler(
         }
     }
 
-    private static TelegramPhoto? GetPhoto(Message message)
+    // Вложение сообщения: обычное фото (берём самое большое из присланных размеров, в MAX оно уйдёт фотографией)
+    // или документ (любой файл, в MAX он уйдёт файлом). Если вложения нет, возвращает null.
+    private static TelegramAttachment? GetAttachment(Message message)
     {
         if (message.Photo is { Length: > 0 } photoSizes)
         {
             var largestSize = photoSizes.MaxBy(photoSize => photoSize.Width * photoSize.Height)!;
-            return new TelegramPhoto(largestSize.FileId, largestSize.FileSize, "photo.jpg", "image/jpeg");
+            return new TelegramAttachment(largestSize.FileId, largestSize.FileSize, "photo.jpg", "image/jpeg", IsPhoto: true);
+        }
+
+        if (message.Document is { } document)
+        {
+            return new TelegramAttachment(
+                document.FileId,
+                document.FileSize,
+                document.FileName ?? "file",
+                document.MimeType ?? "application/octet-stream",
+                IsPhoto: false);
         }
 
         return null;
     }
 
-    private static async Task<MaxOutgoingPhoto> DownloadPhotoAsync(ITelegramBotClient bot, TelegramPhoto photo, CancellationToken cancellationToken)
+    private static async Task<byte[]> DownloadAttachmentAsync(ITelegramBotClient bot, TelegramAttachment attachment, CancellationToken cancellationToken)
     {
-        var file = await bot.GetFile(photo.FileId, cancellationToken);
+        var file = await bot.GetFile(attachment.FileId, cancellationToken);
         if (file.FileSize > MaxDownloadBytes)
         {
-            throw new InvalidOperationException($"картинка больше {MaxDownloadBytes / 1024 / 1024} МБ, Telegram не отдаёт такие файлы боту");
+            throw new InvalidOperationException($"вложение больше {MaxDownloadBytes / 1024 / 1024} МБ, Telegram не отдаёт такие файлы боту");
         }
 
         using var content = new MemoryStream();
         await bot.DownloadFile(file.FilePath!, content, cancellationToken);
-        return new MaxOutgoingPhoto(content.ToArray(), photo.FileName, photo.ContentType);
+        return content.ToArray();
     }
 
     private async Task ReplyAsync(ITelegramBotClient bot, Message message, string text, CancellationToken cancellationToken)

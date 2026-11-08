@@ -42,6 +42,9 @@ public sealed class MaxClient
     private long _lastClientMessageId;
     private readonly ConcurrentDictionary<long, byte> _sentClientMessageIds = new(); // cid отправленных нами сообщений
 
+    // Загруженные нами файлы, которые сервер ещё не обработал: ID файла -> ожидание уведомления «файл готов» (opcode 136).
+    private readonly ConcurrentDictionary<long, TaskCompletionSource> _filesWaitingForProcessing = new();
+
     // Доставка сообщений без дублей. Для каждого чата помним последнее доставленное сообщение: ID и время (мс).
     // Всё хранится только в памяти и защищено _deliveryLock. Предполагается, что ID сообщений в чате растут вместе со временем.
     private readonly Dictionary<long, (long MessageId, long TimeMs)> _lastDeliveredByChat = [];
@@ -369,6 +372,25 @@ public sealed class MaxClient
             return;
         }
 
+        // Сервер сообщает, что загруженный нами файл обработан. Подтверждать это уведомление не нужно (веб-клиент не подтверждает).
+        if (frame.Opcode == MaxOpcode.FileReadyNotification)
+        {
+            try
+            {
+                var fileReady = frame.Body.Deserialize<FileReadyNotification>(MaxJson.Options);
+                if (fileReady is not null && _filesWaitingForProcessing.TryGetValue(fileReady.FileId, out var waiter))
+                {
+                    waiter.TrySetResult();
+                }
+            }
+            catch (Exception ex) when (ex is JsonException or InvalidOperationException)
+            {
+                _logger.LogWarning(ex, "Не удалось разобрать уведомление о готовности файла");
+            }
+
+            return;
+        }
+
         if (frame.Opcode != MaxOpcode.MessageNotification)
         {
             return;
@@ -682,7 +704,73 @@ public sealed class MaxClient
             attaches.Add(new OutgoingPhotoAttachment(await UploadPhotoAsync(photo, cancellationToken)));
         }
 
+        return await SendMessageAsync(chatId, caption, attaches.ToArray(), replyToMessageId, cancellationToken);
+    }
+
+    public async Task<MaxMessage> SendFilesAsync(
+        long chatId,
+        IReadOnlyList<MaxOutgoingFile> files,
+        string caption = "",
+        long? replyToMessageId = null,
+        CancellationToken cancellationToken = default)
+    {
+        var attaches = new List<object>();
+        foreach (var file in files)
+        {
+            attaches.Add(new OutgoingFileAttachment(await UploadFileAsync(file, cancellationToken)));
+        }
+
         return await SendMessageAsync(chatId, caption, [.. attaches], replyToMessageId, cancellationToken);
+    }
+
+    private async Task<long> UploadFileAsync(MaxOutgoingFile file, CancellationToken cancellationToken)
+    {
+        var uploadResponse = await SendRequestAsync<GetFileUploadUrlResponse>(
+            MaxOpcode.GetFileUploadUrl,
+            new GetFileUploadUrlRequest(Count: 1),
+            cancellationToken);
+        if (uploadResponse.Info?.FirstOrDefault() is not { Url: { Length: > 0 } uploadUrl, FileId: not 0 } uploadInfo)
+        {
+            throw new MaxApiException("MAX не выдал адрес для загрузки файла");
+        }
+
+        var fileProcessed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _filesWaitingForProcessing[uploadInfo.FileId] = fileProcessed;
+        try
+        {
+            using var content = new ByteArrayContent(file.Data);
+            content.Headers.ContentType = System.Net.Http.Headers.MediaTypeHeaderValue.TryParse(file.ContentType, out var contentType)
+                ? contentType
+                : new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
+
+            content.Headers.TryAddWithoutValidation("Content-Disposition", $"attachment; filename={Uri.EscapeDataString(file.FileName)}");
+            if (file.Data.Length > 0)
+            {
+                content.Headers.ContentRange = new System.Net.Http.Headers.ContentRangeHeaderValue(0, file.Data.Length - 1, file.Data.Length);
+            }
+
+            using var response = await _httpClient.PostAsync(uploadUrl, content, cancellationToken);
+            if (!response.IsSuccessStatusCode)
+            {
+                var responseText = await response.Content.ReadAsStringAsync(cancellationToken);
+                throw new MaxApiException($"MAX не принял файл: {(int)response.StatusCode} {responseText}");
+            }
+
+            try
+            {
+                await fileProcessed.Task.WaitAsync(TimeSpan.FromSeconds(_config.FileProcessingTimeoutSeconds), cancellationToken);
+            }
+            catch (TimeoutException)
+            {
+                throw new MaxApiException($"MAX не подтвердил обработку файла за {_config.FileProcessingTimeoutSeconds} с");
+            }
+
+            return uploadInfo.FileId;
+        }
+        finally
+        {
+            _filesWaitingForProcessing.TryRemove(uploadInfo.FileId, out _);
+        }
     }
 
     // Загружает фото на сервер MAX и возвращает его токен: спрашиваем адрес загрузки (opcode 80), отправляем на него файл

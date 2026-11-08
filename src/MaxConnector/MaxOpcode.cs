@@ -14,10 +14,16 @@ public static class MaxOpcode
     public const int SendMessage = 64;
     public const int GetPhotoUploadUrl = 80;
     public const int GetVideoLinks = 83;
+    public const int GetFileUploadUrl = 87;
     public const int GetFileLink = 88;
 
     /// <summary>
     /// Уведомление о новом, изменённом или удалённом сообщении.
     /// </summary>
     public const int MessageNotification = 128;
+
+    /// <summary>
+    /// Уведомление о том, что загруженный файл обработан и его можно прикреплять к сообщению.
+    /// </summary>
+    public const int FileReadyNotification = 136;
 }
