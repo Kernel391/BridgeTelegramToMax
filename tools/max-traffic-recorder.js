@@ -1,15 +1,19 @@
-// Запись WebSocket-кадров web.max.ru с маскированием содержимого (версия 2: понимает бинарные кадры).
+// Запись трафика web.max.ru с маскированием содержимого: кадры WebSocket и HTTP-запросы, которые меняют данные
+// (POST, PUT и так далее, например загрузка файла или фото). Версия 3.
 //
 // Как пользоваться: откройте web.max.ru (лучше на экране QR-входа, до авторизации),
 // откройте DevTools (F12) -> Console, вставьте этот файл целиком и нажмите Enter.
 // Дальше входите в аккаунт как обычно. Чтобы забрать результат, выполните в консоли:
 //
-//     copy(__maxWebSocketRecorder.dump())     // копирует ВСЕ кадры в буфер обмена одной строкой, без переводов строк
-//     copy(__maxWebSocketRecorder.dump(10))   // то же, но только кадры начиная с десятого (счёт с нуля)
-//     __maxWebSocketRecorder.show()           // печатает кадры в консоль как раскрывающиеся объекты, чтобы читать глазами
-//     __maxWebSocketRecorder.show(10)         // то же, начиная с десятого кадра
-//     __maxWebSocketRecorder.clear()          // стирает записанное
-//     __maxWebSocketRecorder.reconnect()      // закрывает сокет: сайт переподключится, и запишется рукопожатие и вход
+//     copy(__maxTrafficRecorder.dump())          // копирует ВСЕ кадры в буфер обмена одной строкой, без переводов строк
+//     copy(__maxTrafficRecorder.dump(10))        // то же, но только кадры начиная с десятого (счёт с нуля)
+//     __maxTrafficRecorder.show()                // печатает кадры в консоль как раскрывающиеся объекты, чтобы читать глазами
+//     __maxTrafficRecorder.show(10)              // то же, начиная с десятого кадра
+//     __maxTrafficRecorder.clear()               // стирает записанное
+//     __maxTrafficRecorder.reconnect()           // закрывает сокет: сайт переподключится, и запишется рукопожатие и вход
+//
+// Записи идут в одном списке в порядке прихода, у каждой есть время elapsedMs от вставки скрипта. Поэтому видно, что
+// загрузке файла предшествовало (запрос адреса по WebSocket), что последовало дальше (уведомление «файл готов»).
 //
 // Формат кадров, который видит веб-клиент:
 //   текстовый кадр  -> JSON {ver, cmd, seq, opcode, payload}. Так называются поля в самом протоколе (старая версия
@@ -25,6 +29,20 @@
 // В записи бинарного кадра заголовок разложен на поля version, command, requestId, opcode, compressionFlags,
 // bodyLength, а содержимое лежит в поле body. Если тело было сжато LZ4, добавляется lz4: true.
 //
+// HTTP-запрос записывается одной записью с frameKind "http": поля method, url, requestHeaders, requestBody и,
+// когда сервер ответил, response (status, headers, body). Запрос пишется сразу при отправке, ответ дописывается позже.
+//   url             хост и путь как есть, значения параметров скрыты (числа превращаются в псевдонимы, так что
+//                   id файла из адреса можно сопоставить с fileId из кадра WebSocket)
+//   requestHeaders  заголовки, которые выставил сам сайт. Content-Type, Content-Disposition, Content-Range и ещё
+//                   несколько безопасных показываются как есть, остальные (Cookie, Authorization...) скрыты
+//   requestBody     только описание: вид, размер, тип. Содержимое файла в дамп не попадает
+// GET-запросы (картинки, скрипты, аналитика) по умолчанию не пишутся, это настраивается константой
+// RECORD_ONLY_HTTP_REQUESTS_THAT_CHANGE_DATA ниже.
+//
+// Чего в HTTP-записях не будет: заголовков, которые браузер добавляет сам и которых JavaScript не видит
+// (Origin, Cookie, User-Agent, Content-Length). Они нужны редко; если нужны, смотрите вкладку DevTools -> Network.
+// Не перехватываются запросы из Web Worker и через navigator.sendBeacon.
+//
 // Что скрывается: все строки заменяются на <str:длина> (кроме безопасных полей вроде type или appVersion),
 // бинарные значения на <bin:длина>, большие числа (ID, время) на стабильные псевдонимы вида #3/13d
 // (порядковый номер числа / сколько в нём цифр), поэтому видно, где один и тот же ID встречается в разных местах.
@@ -33,7 +51,7 @@
 // Ограничение: записываются только кадры, отправленные и полученные ПОСЛЕ вставки скрипта. Рукопожатие и вход по
 // токену при загрузке страницы лучше смотреть во вкладке DevTools -> Network -> WS (откройте её ДО загрузки страницы).
 (() => {
-  if (window.__maxWebSocketRecorder) return 'уже установлена';
+  if (window.__maxTrafficRecorder) return 'уже установлена';
 
   // Строки в этих полях не скрываются: в них нет личных данных, а по ним удобно понимать, что происходит.
   const FIELD_NAMES_WITH_SAFE_STRINGS = new Set([
@@ -113,6 +131,19 @@
       position += byteLength;
       return new BinaryValue(byteLength);
     };
+    // Расширение MessagePack (ext): байт типа, затем данные. MAX присылает ID (чатов, сообщений, файлов) как ext
+    // типа 1, внутри которого обычное целое число. Такое число возвращаем числом, чтобы ему достался псевдоним
+    // и один и тот же ID был узнаваем в разных кадрах и в адресах HTTP-запросов. Остальные расширения показываем
+    // бинарным значением (только размер).
+    const readExtension = (dataLength) => {
+      const extensionType = bytes[position++];
+      const data = bytes.subarray(position, position + dataLength);
+      position += dataLength;
+      if (extensionType === 1) {
+        try { return decodeMessagePack(data); } catch { /* внутри не число: покажем как бинарное значение */ }
+      }
+      return new BinaryValue(dataLength);
+    };
     const readArray = (itemCount) => {
       const items = [];
       for (let index = 0; index < itemCount; index++) items.push(readValue());
@@ -152,10 +183,10 @@
         case 0xc4: return readBinary(bytes[position++]);
         case 0xc5: return readBinary(readUint16());
         case 0xc6: return readBinary(readUint32());
-        // ext: байт типа расширения и затем данные. Нам важен только размер, поэтому показываем как бинарное значение.
-        case 0xc7: { const byteLength = bytes[position++]; position += 1; return readBinary(byteLength); }
-        case 0xc8: { const byteLength = readUint16(); position += 1; return readBinary(byteLength); }
-        case 0xc9: { const byteLength = readUint32(); position += 1; return readBinary(byteLength); }
+        // ext: длина данных, затем байт типа расширения и сами данные
+        case 0xc7: return readExtension(bytes[position++]);
+        case 0xc8: return readExtension(readUint16());
+        case 0xc9: return readExtension(readUint32());
         case 0xca: { const number = view.getFloat32(position); position += 4; return number; }
         case 0xcb: { const number = view.getFloat64(position); position += 8; return number; }
         case 0xcc: return bytes[position++];
@@ -166,12 +197,12 @@
         case 0xd1: { const number = view.getInt16(position); position += 2; return number; }
         case 0xd2: { const number = view.getInt32(position); position += 4; return number; }
         case 0xd3: { const number = view.getBigInt64(position); position += 8; return number; }
-        // fixext: байт типа расширения и затем 1, 2, 4, 8 или 16 байт данных
-        case 0xd4: return readBinary(2);
-        case 0xd5: return readBinary(3);
-        case 0xd6: return readBinary(5);
-        case 0xd7: return readBinary(9);
-        case 0xd8: return readBinary(17);
+        // fixext: длина данных зашита в тип (1, 2, 4, 8 или 16 байт), затем байт типа расширения и данные
+        case 0xd4: return readExtension(1);
+        case 0xd5: return readExtension(2);
+        case 0xd6: return readExtension(4);
+        case 0xd7: return readExtension(8);
+        case 0xd8: return readExtension(16);
         case 0xd9: return readString(bytes[position++]);
         case 0xda: return readString(readUint16());
         case 0xdb: return readString(readUint32());
@@ -340,7 +371,196 @@
     },
   });
 
-  window.__maxWebSocketRecorder = {
+  // ---------- HTTP-запросы (XMLHttpRequest и fetch) ----------
+
+  // Писать ли только запросы, которые меняют данные (всё, кроме GET, HEAD и OPTIONS). Обычных запросов у сайта очень
+  // много (картинки, скрипты, аналитика), а нас интересуют загрузки. Поставьте false, чтобы писать вообще все запросы.
+  const RECORD_ONLY_HTTP_REQUESTS_THAT_CHANGE_DATA = true;
+
+  // Значения этих заголовков не скрываются (имена в нижнем регистре): секретов в них нет, а формат нам и нужен.
+  const HEADER_NAMES_WITH_SAFE_VALUES = new Set([
+    'content-type', 'content-disposition', 'content-range', 'content-length', 'content-encoding',
+    'accept', 'range', 'x-requested-with',
+  ]);
+
+  // Значения этих параметров адреса не скрываются.
+  const QUERY_PARAMETER_NAMES_WITH_SAFE_VALUES = new Set(['clientType']);
+
+  const shouldRecordHttpRequest = (method) => {
+    if (!RECORD_ONLY_HTTP_REQUESTS_THAT_CHANGE_DATA) return true;
+    return !['GET', 'HEAD', 'OPTIONS'].includes(String(method).toUpperCase());
+  };
+
+  // Адрес запроса: хост и путь как есть, значения параметров скрыты. Целые числа становятся псевдонимами
+  // (те же, что в WebSocket-кадрах), поэтому, например, id файла в адресе можно сопоставить с fileId из кадра.
+  const maskUrl = (urlText) => {
+    try {
+      const url = new URL(urlText, window.location.href);
+      const queryParameters = {};
+      for (const [name, value] of url.searchParams) {
+        if (QUERY_PARAMETER_NAMES_WITH_SAFE_VALUES.has(name)) queryParameters[name] = value;
+        else if (/^-?\d+$/.test(value)) queryParameters[name] = maskValue(BigInt(value), name);
+        else queryParameters[name] = `<str:${value.length}>`;
+      }
+      return { address: url.host + url.pathname, queryParameters };
+    } catch {
+      return `<адрес не разобрался: ${String(urlText).length} символов>`;
+    }
+  };
+
+  // headerEntries: список пар [имя, значение].
+  const maskHeaders = (headerEntries) => {
+    const maskedHeaders = {};
+    for (const [name, value] of headerEntries) {
+      const isSafe = HEADER_NAMES_WITH_SAFE_VALUES.has(String(name).toLowerCase());
+      maskedHeaders[name] = isSafe ? value : `<str:${String(value).length}>`;
+    }
+    return maskedHeaders;
+  };
+
+  // Только описание тела запроса: вид, размер и тип. Само содержимое (в том числе файла) в запись не попадает.
+  const describeRequestBody = (body) => {
+    if (body === null || body === undefined) return null;
+    if (typeof body === 'string') return { kind: 'text', length: body.length };
+    if (typeof File !== 'undefined' && body instanceof File) return { kind: 'File', byteLength: body.size, type: body.type };
+    if (body instanceof Blob) return { kind: 'Blob', byteLength: body.size, type: body.type };
+    if (body instanceof ArrayBuffer) return { kind: 'ArrayBuffer', byteLength: body.byteLength };
+    if (ArrayBuffer.isView(body)) return { kind: body.constructor.name, byteLength: body.byteLength };
+    if (body instanceof FormData) {
+      const fields = [...body.entries()].map(([name, value]) => (value instanceof Blob
+        ? { name, kind: 'file', byteLength: value.size, type: value.type }
+        : { name, kind: 'text', length: String(value).length }));
+      return { kind: 'FormData', fields };
+    }
+    if (body instanceof URLSearchParams) return { kind: 'URLSearchParams', parameterNames: [...body.keys()] };
+    if (typeof ReadableStream !== 'undefined' && body instanceof ReadableStream) return { kind: 'ReadableStream' };
+    return { kind: Object.prototype.toString.call(body) };
+  };
+
+  // Тело ответа, пришедшее текстом: JSON показывается с маскированием, остальное только длиной.
+  const describeResponseText = (contentType, text) => {
+    if (/json/i.test(contentType)) {
+      try { return maskValue(JSON.parse(text)); } catch { /* не JSON: опишем длиной */ }
+    }
+    return `<текст ${text.length} символов>`;
+  };
+
+  // Записывает исходящий HTTP-запрос сразу при отправке; ответ дописывается позже функцией fillHttpResponse.
+  const recordHttpRequest = (method, url, headerEntries, body) => {
+    const record = {
+      index: recordedFrames.length,
+      elapsedMs: Math.round(performance.now() - recordingStartedAtMs),
+      direction: 'out',
+      frameKind: 'http',
+      method: String(method).toUpperCase(),
+      url: maskUrl(url),
+      requestHeaders: maskHeaders(headerEntries),
+      requestBody: describeRequestBody(body),
+      response: null,
+    };
+    recordedFrames.push(record);
+    return record;
+  };
+
+  const fillHttpResponse = (record, status, statusText, headerEntries, body) => {
+    record.response = {
+      respondedAfterMs: Math.round(performance.now() - recordingStartedAtMs) - record.elapsedMs,
+      status,
+      statusText,
+      headers: maskHeaders(headerEntries),
+      body,
+    };
+  };
+
+  // Из строки заголовков ответа XMLHttpRequest («Имя: значение» на каждой строке) делает список пар [имя, значение].
+  const parseRawHeaders = (rawHeaders) => rawHeaders
+    .split(/\r?\n/)
+    .filter((line) => line.includes(':'))
+    .map((line) => {
+      const colonIndex = line.indexOf(':');
+      return [line.slice(0, colonIndex).trim(), line.slice(colonIndex + 1).trim()];
+    });
+
+  // Тело ответа XMLHttpRequest: зависит от того, какой responseType запросил сайт.
+  const describeXhrResponseBody = (xhr) => {
+    const contentType = xhr.getResponseHeader('content-type') ?? '';
+    switch (xhr.responseType) {
+      case '':
+      case 'text': return describeResponseText(contentType, xhr.responseText);
+      case 'json': return maskValue(xhr.response);
+      case 'arraybuffer': return { kind: 'ArrayBuffer', byteLength: xhr.response ? xhr.response.byteLength : 0 };
+      case 'blob': return { kind: 'Blob', byteLength: xhr.response ? xhr.response.size : 0, type: contentType };
+      default: return `<тело ответа типа ${xhr.responseType}>`;
+    }
+  };
+
+  // XMLHttpRequest: адрес и метод известны в open, заголовки собираются в setRequestHeader, тело приходит в send.
+  const xhrRequestDetails = new WeakMap();
+  const originalXhrOpen = XMLHttpRequest.prototype.open;
+  const originalXhrSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+  const originalXhrSend = XMLHttpRequest.prototype.send;
+
+  XMLHttpRequest.prototype.open = function (method, url, ...otherArguments) {
+    xhrRequestDetails.set(this, { method: String(method), url: String(url), headerEntries: [] });
+    return originalXhrOpen.call(this, method, url, ...otherArguments);
+  };
+
+  XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+    const details = xhrRequestDetails.get(this);
+    if (details) details.headerEntries.push([name, value]);
+    return originalXhrSetRequestHeader.call(this, name, value);
+  };
+
+  XMLHttpRequest.prototype.send = function (body) {
+    try {
+      const details = xhrRequestDetails.get(this);
+      if (details && shouldRecordHttpRequest(details.method)) {
+        const record = recordHttpRequest(details.method, details.url, details.headerEntries, body);
+        this.addEventListener('loadend', () => {
+          try {
+            fillHttpResponse(record, this.status, this.statusText, parseRawHeaders(this.getAllResponseHeaders()), describeXhrResponseBody(this));
+          } catch { /* запись не должна ломать сайт */ }
+        });
+      }
+    } catch { /* запись не должна ломать сайт */ }
+    return originalXhrSend.call(this, body);
+  };
+
+  // fetch: метод, адрес, заголовки и тело берём из аргументов вызова; ответ читаем с копии, чтобы не мешать сайту.
+  const originalFetch = window.fetch;
+  if (originalFetch) {
+    window.fetch = function (input, init) {
+      let record = null;
+      try {
+        const request = input instanceof Request ? input : null;
+        const method = (init && init.method) || (request && request.method) || 'GET';
+        if (shouldRecordHttpRequest(method)) {
+          const headerEntries = [...new Headers((init && init.headers) || (request && request.headers) || [])];
+          record = recordHttpRequest(method, request ? request.url : String(input), headerEntries, init && init.body);
+        }
+      } catch { /* запись не должна ломать сайт */ }
+
+      const responsePromise = originalFetch.apply(this, arguments);
+      if (record) {
+        responsePromise.then(
+          async (response) => {
+            try {
+              const contentType = response.headers.get('content-type') ?? '';
+              // Читаем только текстовые ответы: большие файлы дважды скачивать не нужно.
+              const body = /json|text/i.test(contentType)
+                ? describeResponseText(contentType, await response.clone().text())
+                : `<тело типа ${contentType || 'неизвестного'}, не читается>`;
+              fillHttpResponse(record, response.status, response.statusText, [...response.headers], body);
+            } catch { /* запись не должна ломать сайт */ }
+          },
+          (error) => { record.response = { error: String((error && error.message) || error) }; },
+        );
+      }
+      return responsePromise;
+    };
+  }
+
+  window.__maxTrafficRecorder = {
     frames: recordedFrames,
 
     // Все кадры (начиная с fromIndex) одной строкой JSON без переводов строк: удобно копировать через copy(...).
